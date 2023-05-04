@@ -254,7 +254,8 @@ class PartialTSNEEmbedding(np.ndarray):
         obj.gradient_descent_params = gradient_descent_params
 
         if optimizer is None:
-            optimizer = gradient_descent()
+            #optimizer = gradient_descent()
+            optimizer = diag_SG()
         elif not isinstance(optimizer, gradient_descent):
             raise TypeError(
                 "`optimizer` must be an instance of `%s`, but got `%s`."
@@ -523,7 +524,8 @@ class TSNEEmbedding(np.ndarray):
         obj.random_state = random_state
 
         if optimizer is None:
-            optimizer = gradient_descent()
+            #optimizer = gradient_descent()
+            optimizer = diag_SG()
         elif not isinstance(optimizer, gradient_descent):
             raise TypeError(
                 "`optimizer` must be an instance of `%s`, but got `%s`."
@@ -976,7 +978,8 @@ class TSNEEmbedding(np.ndarray):
         self.affinities = state[-7]
 
         if len(state) == 12:  # backwards compat (when I forgot optimizer)
-            self.optimizer = gradient_descent()
+            #self.optimizer = gradient_descent()
+            self.optimizer = diag_SG()
             super().__setstate__(state[:-7])
         else:
             self.optimizer = state[-8]
@@ -1569,6 +1572,262 @@ def kl_divergence_fft(
     return kl_divergence_, gradient
 
 
+class diag_SG:
+    def __init__(self):
+        self.gains = None
+        self.update = None
+
+    def copy(self):
+        optimizer = self.__class__()
+        if self.gains is not None:
+            optimizer_gains = np.copy(self.gains)
+        if self.update is not None:
+            optimizer.update = np.copy(self.update)
+        return optimizer
+
+    def __call__(
+        self,
+        embedding,
+        P,
+        n_iter,
+        objective_function,
+        learning_rate="auto",
+        momentum=0.8,
+        exaggeration=None,
+        dof=1,
+        min_gain=0.01,
+        max_grad_norm=None,
+        max_step_norm=5,
+        theta=0.5,
+        n_interpolation_points=3,
+        min_num_intervals=50,
+        ints_in_interval=1,
+        reference_embedding=None,
+        n_jobs=1,
+        use_callbacks=False,
+        callbacks=None,
+        callbacks_every_iters=50,
+        verbose=False,
+    ):
+        
+        assert isinstance(embedding, np.ndarray), (
+            "`embedding` must be an instance of `np.ndarray`. Got `%s` instead"
+            % type(embedding)
+        )
+
+        if reference_embedding is not None:
+            assert isinstance(reference_embedding, np.ndarray), (
+                "`reference_embedding` must be an instance of `np.ndarray`. Got "
+                "`%s` instead" % type(reference_embedding)
+            )
+
+        # If the interpolation grid has not yet been evaluated, do it now
+        if (
+            reference_embedding is not None and
+            reference_embedding.interp_coeffs is None and
+            objective_function is kl_divergence_fft
+        ):
+            reference_embedding.prepare_interpolation_grid()
+
+        # If we're running transform and using the interpolation scheme, then we
+        # should limit the range where new points can go to
+        should_limit_range = False
+        if reference_embedding is not None:
+            if reference_embedding.box_x_lower_bounds is not None:
+                should_limit_range = True
+                lower_limit = reference_embedding.box_x_lower_bounds[0]
+                upper_limit = reference_embedding.box_x_lower_bounds[-1]
+
+        if self.update is None:
+            self.update = np.zeros_like(embedding).view(np.ndarray)
+        if self.gains is None:
+            self.gains = np.ones_like(embedding).view(np.ndarray)
+
+        bh_params = {"theta": theta}
+        fft_params = {
+            "n_interpolation_points": n_interpolation_points,
+            "min_num_intervals": min_num_intervals,
+            "ints_in_interval": ints_in_interval,
+        }
+
+        # Lie about the P values for bigger attraction forces
+        if exaggeration is None:
+            exaggeration = 1
+
+        if exaggeration != 1:
+            P *= exaggeration
+
+        # Notify the callbacks that the optimization is about to start
+        if isinstance(callbacks, Iterable):
+            for callback in callbacks:
+                # Only call function if present on object
+                getattr(callback, "optimization_about_to_start", lambda: ...)()
+
+        timer = utils.Timer(
+            "Running optimization with exaggeration=%.2f, lr=%.2f for %d iterations..." % (
+                exaggeration, learning_rate, n_iter
+            ),
+            verbose=verbose,
+        )
+        timer.__enter__()
+
+        if verbose:
+            start_time = time()
+
+        D_bar_prev = np.ones(embedding.shape)
+        gamma = 0.101
+        c     = 1e-3
+        c_k   = lambda k : c / (k + 1)**gamma 
+        eta_k = 0.1
+        a_k = lambda k: 10 / (50 + 1 + k)**0.501
+
+        for iteration in range(n_iter):
+            should_call_callback = use_callbacks and (iteration + 1) % callbacks_every_iters == 0
+            # Evaluate error on 50 iterations for logging, or when callbacks
+            should_eval_error = should_call_callback or \
+                (verbose and (iteration + 1) % 50 == 0)
+            should_eval_error = True
+
+            error, gradient = objective_function(
+                embedding,
+                P,
+                dof=dof,
+                bh_params=bh_params,
+                fft_params=fft_params,
+                reference_embedding=reference_embedding,
+                n_jobs=n_jobs,
+                should_eval_error=should_eval_error,
+            )
+
+            # Clip gradients to avoid points shooting off. This can be an issue
+            # when applying transform and points are initialized so that the new
+            # points overlap with the reference points, leading to large
+            # gradients
+            if max_grad_norm is not None:
+                norm = np.linalg.norm(gradient, axis=1)
+                coeff = max_grad_norm / (norm + 1e-6)
+                mask = coeff < 1
+                gradient[mask] *= coeff[mask, None]
+
+            # Correct the KL divergence w.r.t. the exaggeration if needed
+            if should_eval_error and exaggeration != 1:
+                error = error / exaggeration - np.log(exaggeration)
+
+            if should_call_callback:
+                # Continue only if all the callbacks say so
+                should_stop = any(
+                    (bool(c(iteration + 1, error, embedding)) for c in callbacks)
+                )
+                if should_stop:
+                    # Make sure to un-exaggerate P so it's not corrupted in future runs
+                    if exaggeration != 1:
+                        P /= exaggeration
+                    raise OptimizationInterrupt(error=error, final_embedding=embedding)
+
+            grad_direction_flipped = np.sign(self.update) != np.sign(gradient)
+            grad_direction_same = np.invert(grad_direction_flipped)
+            self.gains[grad_direction_flipped] += 0.2
+            self.gains[grad_direction_same] = (
+                self.gains[grad_direction_same] * 0.8 + min_gain
+            )
+            gradient = gradient.view(np.ndarray)
+            #print(learning_rate, min_gain, self.gains, gradient)
+
+            # diagSG
+            # Sample delta_k from zero-centered Bernoulli  distribution
+            delta_k = np.random.choice([-1, 1], size=embedding.shape, p=[0.5, 0.5])
+            _, gradient1 = objective_function(
+                embedding + c_k(iteration) * delta_k,
+                P,
+                dof=dof,
+                bh_params=bh_params,
+                fft_params=fft_params,
+                reference_embedding=reference_embedding,
+                n_jobs=n_jobs,
+                should_eval_error=False,
+            )
+            _, gradient2 = objective_function(
+                embedding - c_k(iteration) * delta_k,
+                P,
+                dof=dof,
+                bh_params=bh_params,
+                fft_params=fft_params,
+                reference_embedding=reference_embedding,
+                n_jobs=n_jobs,
+                should_eval_error=False,
+            )
+            D_hat_k     = (gradient1 - gradient2) / (2 * c_k(iteration) * delta_k)
+            D_bar_k     = D_bar_prev/(iteration + 1) + D_hat_k / (iteration + 1)
+            D_bar_bar_k = np.abs(D_bar_k) + eta_k
+            D_bar_prev  = D_bar_k
+            #print("c_k", c_k(iteration))
+            #print("Gradient: ", gradient)
+            #print("Gradient1 - Gradient2: ", gradient1 - gradient2)
+            #print(np.reciprocal(D_bar_bar_k))
+            #print("WTF")
+            #print(self.gains)
+            #print(learning_rate)
+            #print("--------------------------------")
+            self.update = momentum * self.update - learning_rate * self.gains * np.reciprocal(D_bar_bar_k) * gradient
+            #self.update = momentum * self.update - a_k(iteration) * np.reciprocal(D_bar_bar_k) * gradient
+            # Clip the update sizes
+            if max_step_norm is not None:
+                update_norms = np.linalg.norm(self.update, axis=1, keepdims=True)
+                mask = update_norms.squeeze() > max_step_norm
+                self.update[mask] /= update_norms[mask]
+                self.update[mask] *= max_step_norm
+
+            embedding += self.update
+
+            # Zero-mean the embedding only if we're not adding new data points,
+            # otherwise this will reset point positions
+            if reference_embedding is None:
+                embedding -= np.mean(embedding, axis=0)
+
+            # Limit any new points within the circle defined by the interpolation grid
+            if should_limit_range:
+                if embedding.shape[1] == 1:
+                    mask = (embedding < lower_limit) | (embedding > upper_limit)
+                    np.clip(embedding, lower_limit, upper_limit, out=embedding)
+                elif embedding.shape[1] == 2:
+                    r_limit = max(abs(lower_limit), abs(upper_limit))
+                    embedding, mask = utils.clip_point_to_disc(embedding, r_limit, inplace=True)
+
+                # Zero out the momentum terms for the points that hit the boundary
+                self.gains[~mask] = 0
+
+            print("INFO:%4d %6.4f, " % (
+                iteration + 1, error))
+
+            if verbose and (iteration + 1) % 50 == 0:
+                stop_time = time()
+                print("Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec" % (
+                    iteration + 1, error, stop_time - start_time))
+                start_time = time()
+
+        timer.__exit__()
+
+        # Make sure to un-exaggerate P so it's not corrupted in future runs
+        if exaggeration != 1:
+            P /= exaggeration
+
+        # The error from the loop is the one for the previous, non-updated
+        # embedding. We need to return the error for the actual final embedding, so
+        # compute that at the end before returning
+        error, _ = objective_function(
+            embedding,
+            P,
+            dof=dof,
+            bh_params=bh_params,
+            fft_params=fft_params,
+            reference_embedding=reference_embedding,
+            n_jobs=n_jobs,
+            should_eval_error=True,
+        )
+        print("INFO:%4d %6.4f, " % (
+            iteration + 1, error))
+        
+        return error, embedding
 class gradient_descent:
     def __init__(self):
         self.gains = None
@@ -1785,7 +2044,7 @@ class gradient_descent:
             # Evaluate error on 50 iterations for logging, or when callbacks
             should_eval_error = should_call_callback or \
                 (verbose and (iteration + 1) % 50 == 0)
-
+            should_eval_error = True
             error, gradient = objective_function(
                 embedding,
                 P,
@@ -1857,7 +2116,8 @@ class gradient_descent:
 
                 # Zero out the momentum terms for the points that hit the boundary
                 self.gains[~mask] = 0
-
+            print("INFO:%4d %6.4f, " % (
+                iteration + 1, error))
             if verbose and (iteration + 1) % 50 == 0:
                 stop_time = time()
                 print("Iteration %4d, KL divergence %6.4f, 50 iterations in %.4f sec" % (
@@ -1883,5 +2143,7 @@ class gradient_descent:
             n_jobs=n_jobs,
             should_eval_error=True,
         )
+        print("INFO:%4d %6.4f, " % (
+            iteration + 1, error))
 
         return error, embedding
